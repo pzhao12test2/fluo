@@ -26,12 +26,10 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Set;
-import java.util.function.Consumer;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterators;
-import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -53,14 +51,10 @@ import org.apache.accumulo.core.data.Range;
 import org.apache.accumulo.core.data.Value;
 import org.apache.fluo.accumulo.iterators.PrewriteIterator;
 import org.apache.fluo.accumulo.util.ColumnConstants;
-import org.apache.fluo.accumulo.util.ReadLockUtil;
 import org.apache.fluo.accumulo.values.DelLockValue;
-import org.apache.fluo.accumulo.values.DelReadLockValue;
 import org.apache.fluo.accumulo.values.LockValue;
-import org.apache.fluo.accumulo.values.ReadLockValue;
 import org.apache.fluo.api.client.AbstractTransactionBase;
 import org.apache.fluo.api.client.Snapshot;
-import org.apache.fluo.api.client.SnapshotBase;
 import org.apache.fluo.api.client.scanner.ScannerBuilder;
 import org.apache.fluo.api.data.Bytes;
 import org.apache.fluo.api.data.Column;
@@ -77,17 +71,13 @@ import org.apache.fluo.core.exceptions.AlreadyAcknowledgedException;
 import org.apache.fluo.core.exceptions.StaleScanException;
 import org.apache.fluo.core.impl.scanner.ScannerBuilderImpl;
 import org.apache.fluo.core.oracle.Stamp;
-import org.apache.fluo.core.util.ByteUtil;
 import org.apache.fluo.core.util.ColumnUtil;
 import org.apache.fluo.core.util.ConditionalFlutation;
 import org.apache.fluo.core.util.FluoCondition;
 import org.apache.fluo.core.util.Flutation;
 import org.apache.fluo.core.util.Hex;
 import org.apache.fluo.core.util.SpanUtil;
-import org.apache.fluo.core.util.UtilWaitThread;
 
-import static org.apache.fluo.accumulo.util.ColumnConstants.PREFIX_MASK;
-import static org.apache.fluo.accumulo.util.ColumnConstants.RLOCK_PREFIX;
 import static org.apache.fluo.api.observer.Observer.NotificationType.STRONG;
 import static org.apache.fluo.api.observer.Observer.NotificationType.WEAK;
 
@@ -98,23 +88,17 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
 
   public static final byte[] EMPTY = new byte[0];
   public static final Bytes EMPTY_BS = Bytes.of(EMPTY);
-  private static final Bytes DELETE =
-      Bytes.of("special delete object f804266bf94935edd45ae3e6c287b93c1814295c");
-  private static final Bytes NTFY_VAL =
-      Bytes.of("special ntfy value ce0c523e6e4dc093be8a2736b82eca1b95f97ed4");
-  private static final Bytes RLOCK_VAL =
-      Bytes.of("special rlock value 94da84e7796ff3b23b779805d820a33f1997cb8b");
+  private static final Bytes DELETE = Bytes
+      .of("special delete object f804266bf94935edd45ae3e6c287b93c1814295c");
+  private static final Bytes NTFY_VAL = Bytes
+      .of("special ntfy value ce0c523e6e4dc093be8a2736b82eca1b95f97ed4");
 
   private static boolean isWrite(Bytes val) {
-    return val != NTFY_VAL && val != RLOCK_VAL;
+    return val != NTFY_VAL;
   }
 
   private static boolean isDelete(Bytes val) {
     return val == DELETE;
-  }
-
-  private static boolean isReadLock(Bytes val) {
-    return val == RLOCK_VAL;
   }
 
   private static enum TxStatus {
@@ -126,9 +110,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
   private final Map<Bytes, Set<Column>> weakNotifications = new HashMap<>();
   private final Set<Column> observedColumns;
   private final Environment env;
-  private final Map<Bytes, Set<Column>> columnsRead = new HashMap<>();
-  // Tracks row columns that were observed to have had a read lock in the past.
-  private final Map<Bytes, Set<Column>> readLocksSeen = new HashMap<>();
+  final Map<Bytes, Set<Column>> columnsRead = new HashMap<>();
   private final TxStats stats;
   private Notification notification;
   private Notification weakNotification;
@@ -188,8 +170,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
   @Override
   public Map<Column, Bytes> get(Bytes row, Set<Column> columns) {
     checkIfOpen();
-    return getImpl(row, columns, kve -> {
-    });
+    return getImpl(row, columns);
   }
 
   @Override
@@ -202,8 +183,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
 
     env.getSharedResources().getVisCache().validate(columns);
 
-    ParallelSnapshotScanner pss =
-        new ParallelSnapshotScanner(rows, columns, env, startTs, stats, readLocksSeen);
+    ParallelSnapshotScanner pss = new ParallelSnapshotScanner(rows, columns, env, startTs, stats);
 
     Map<Bytes, Map<Column, Bytes>> ret = pss.scan();
 
@@ -222,8 +202,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       return Collections.emptyMap();
     }
 
-    ParallelSnapshotScanner pss =
-        new ParallelSnapshotScanner(rowColumns, env, startTs, stats, readLocksSeen);
+    ParallelSnapshotScanner pss = new ParallelSnapshotScanner(rowColumns, env, startTs, stats);
 
     Map<Bytes, Map<Column, Bytes>> scan = pss.scan();
     Map<RowColumn, Bytes> ret = new HashMap<>();
@@ -238,8 +217,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
     return ret;
   }
 
-  private Map<Column, Bytes> getImpl(Bytes row, Set<Column> columns,
-      Consumer<Entry<Key, Value>> locksSeen) {
+  private Map<Column, Bytes> getImpl(Bytes row, Set<Column> columns) {
 
     // TODO push visibility filtering to server side?
 
@@ -263,26 +241,19 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
           cols.add(column);
         }
       }
-      opts = new SnapshotScanner.Opts(Span.exact(row), columns, true);
+      opts = new SnapshotScanner.Opts(Span.exact(row), columns);
     } else {
-      opts = new SnapshotScanner.Opts(Span.exact(row), columns, true);
+      opts = new SnapshotScanner.Opts(Span.exact(row), columns);
     }
 
     Map<Column, Bytes> ret = new HashMap<>();
-    Set<Column> readLockCols = null;
 
-    for (Entry<Key, Value> kve : new SnapshotScanner(env, opts, startTs, stats, locksSeen)) {
-
+    for (Entry<Key, Value> kve : new SnapshotScanner(env, opts, startTs, stats)) {
       Column col = ColumnUtil.convert(kve.getKey());
-      if (shouldCopy && !columns.contains(col)) {
-        continue;
-      }
-
-      if ((kve.getKey().getTimestamp() & PREFIX_MASK) == RLOCK_PREFIX) {
-        if (readLockCols == null) {
-          readLockCols = readLocksSeen.computeIfAbsent(row, k -> new HashSet<>());
+      if (shouldCopy) {
+        if (columns.contains(col)) {
+          ret.put(col, Bytes.of(kve.getValue().get()));
         }
-        readLockCols.add(col);
       } else {
         ret.put(col, Bytes.of(kve.getValue().get()));
       }
@@ -309,31 +280,6 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
     colsRead.addAll(columns);
   }
 
-  void setReadLock(Bytes row, Column col) {
-    checkIfOpen();
-    Objects.requireNonNull(row);
-    Objects.requireNonNull(col);
-
-    if (col.getFamily().equals(ColumnConstants.NOTIFY_CF)) {
-      throw new IllegalArgumentException(ColumnConstants.NOTIFY_CF + " is a reserved family");
-    }
-
-    env.getSharedResources().getVisCache().validate(col);
-
-    Map<Column, Bytes> colUpdates = updates.computeIfAbsent(row, k -> new HashMap<>());
-    Bytes curVal = colUpdates.get(col);
-    if (curVal != null && (isWrite(curVal) || isDelete(curVal))) {
-      throw new AlreadySetException("Attemped read lock after write lock " + row + " " + col);
-    }
-
-    colUpdates.put(col, RLOCK_VAL);
-  }
-
-  @Override
-  public SnapshotBase withReadLock() {
-    return new ReadLockSnapshot(this);
-  }
-
   @Override
   public void set(Bytes row, Column col, Bytes value) throws AlreadySetException {
     checkIfOpen();
@@ -347,7 +293,13 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
 
     env.getSharedResources().getVisCache().validate(col);
 
-    Map<Column, Bytes> colUpdates = updates.computeIfAbsent(row, k -> new HashMap<>());
+    // TODO copy?
+
+    Map<Column, Bytes> colUpdates = updates.get(row);
+    if (colUpdates == null) {
+      colUpdates = new HashMap<>();
+      updates.put(row, colUpdates);
+    }
 
     Bytes curVal = colUpdates.get(col);
     if (curVal != null && isWrite(curVal)) {
@@ -394,10 +346,6 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       PrewriteIterator.enableAckCheck(iterConf, notification.getTimestamp());
     }
 
-    if (isReadLock(val)) {
-      PrewriteIterator.setReadlock(iterConf);
-    }
-
     Condition cond = new FluoCondition(env, col).setIterators(iterConf);
 
     if (cm == null) {
@@ -410,13 +358,8 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       cm.put(col, ColumnConstants.DATA_PREFIX | startTs, val.toArray());
     }
 
-    if (isReadLock(val)) {
-      cm.put(col, ColumnConstants.RLOCK_PREFIX | ReadLockUtil.encodeTs(startTs, false),
-          ReadLockValue.encode(primaryRow, primaryColumn, getTransactorID()));
-    } else {
-      cm.put(col, ColumnConstants.LOCK_PREFIX | startTs, LockValue.encode(primaryRow, primaryColumn,
-          isWrite(val), isDelete(val), isTriggerRow, getTransactorID()));
-    }
+    cm.put(col, ColumnConstants.LOCK_PREFIX | startTs, LockValue.encode(primaryRow, primaryColumn,
+        isWrite(val), isDelete(val), isTriggerRow, getTransactorID()));
 
     return cm;
   }
@@ -476,7 +419,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
           numCollisions += cols.size();
         }
 
-        sb.append("Collisions(");
+        sb.append("Collsions(");
         sb.append(numCollisions);
         sb.append("):");
 
@@ -554,7 +497,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
    *
    * @param cd Commit data
    */
-  private void readUnread(CommitData cd, Consumer<Entry<Key, Value>> locksSeen) throws Exception {
+  private void readUnread(CommitData cd) throws Exception {
     // TODO make async
     // TODO need to keep track of ranges read (not ranges passed in, but actual data read... user
     // may not iterate over entire range
@@ -574,84 +517,8 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
     }
 
     for (Entry<Bytes, Set<Column>> entry : columnsToRead.entrySet()) {
-      getImpl(entry.getKey(), entry.getValue(), locksSeen);
+      getImpl(entry.getKey(), entry.getValue());
     }
-  }
-
-  private void checkForOrphanedReadLocks(CommitData cd, Map<Bytes, Set<Column>> locksResolved)
-      throws Exception {
-
-    if (readLocksSeen.size() == 0) {
-      return;
-    }
-
-    Map<Bytes, Set<Column>> rowColsToCheck = new HashMap<>();
-
-    for (Entry<Bytes, Set<Column>> entry : cd.getRejected().entrySet()) {
-
-      Set<Column> resolvedColumns =
-          locksResolved.getOrDefault(entry.getKey(), Collections.emptySet());
-
-      Set<Column> colsToCheck = null;
-      Set<Column> readLockCols = readLocksSeen.get(entry.getKey());
-      if (readLockCols != null) {
-        for (Column candidate : Sets.intersection(readLockCols, entry.getValue())) {
-          if (resolvedColumns.contains(candidate)) {
-            // A write lock was seen and this is probably what caused the collision, no need to
-            // check this column for read locks.
-            continue;
-          }
-
-          if (!isReadLock(updates.getOrDefault(entry.getKey(), Collections.emptyMap())
-              .getOrDefault(candidate, EMPTY_BS))) {
-            if (colsToCheck == null) {
-              colsToCheck = new HashSet<>();
-            }
-            colsToCheck.add(candidate);
-          }
-        }
-
-        if (colsToCheck != null) {
-          rowColsToCheck.put(entry.getKey(), colsToCheck);
-        }
-      }
-    }
-
-    if (rowColsToCheck.size() > 0) {
-
-      long startTime = System.currentTimeMillis();
-      long waitTime = SnapshotScanner.INITIAL_WAIT_TIME;
-
-      boolean resolved = false;
-
-      List<Entry<Key, Value>> openReadLocks = LockResolver.getOpenReadLocks(env, rowColsToCheck);
-
-      startTime = System.currentTimeMillis();
-
-      while (!resolved) {
-        resolved = LockResolver.resolveLocks(env, startTs, stats, openReadLocks, startTime);
-        if (!resolved) {
-          UtilWaitThread.sleep(waitTime);
-          stats.incrementLockWaitTime(waitTime);
-          waitTime = Math.min(SnapshotScanner.MAX_WAIT_TIME, waitTime * 2);
-
-          openReadLocks = LockResolver.getOpenReadLocks(env, rowColsToCheck);
-        }
-      }
-    }
-  }
-
-  private void checkForOrphanedLocks(CommitData cd) throws Exception {
-
-    Map<Bytes, Set<Column>> locksSeen = new HashMap<>();
-
-    readUnread(cd, kve -> {
-      Bytes row = ByteUtil.toBytes(kve.getKey().getRowData());
-      Column col = ColumnUtil.convert(kve.getKey());
-      locksSeen.computeIfAbsent(row, k -> new HashSet<>()).add(col);
-    });
-
-    checkForOrphanedReadLocks(cd, locksSeen);
   }
 
   private boolean checkForAckCollision(ConditionalMutation cm) {
@@ -662,14 +529,15 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
 
       for (ColumnUpdate cu : updates) {
         // TODO avoid create col vis object
-        Column col = new Column(Bytes.of(cu.getColumnFamily()), Bytes.of(cu.getColumnQualifier()),
-            Bytes.of(cu.getColumnVisibility()));
+        Column col =
+            new Column(Bytes.of(cu.getColumnFamily()), Bytes.of(cu.getColumnQualifier()),
+                Bytes.of(cu.getColumnVisibility()));
 
         if (notification.getColumn().equals(col)) {
           // check to see if ACK exist after notification
           Key startKey = SpanUtil.toKey(notification.getRowColumn());
-          startKey.setTimestamp(
-              ColumnConstants.ACK_PREFIX | (Long.MAX_VALUE & ColumnConstants.TIMESTAMP_MASK));
+          startKey.setTimestamp(ColumnConstants.ACK_PREFIX
+              | (Long.MAX_VALUE & ColumnConstants.TIMESTAMP_MASK));
 
           Key endKey = SpanUtil.toKey(notification.getRowColumn());
           endKey.setTimestamp(ColumnConstants.ACK_PREFIX | (notification.getTimestamp() + 1));
@@ -911,8 +779,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
     }
   }
 
-  private void beginCommitAsync(CommitData cd, AsyncCommitObserver commitCallback,
-      RowColumn primary) {
+  private void beginCommitAsync(CommitData cd, AsyncCommitObserver commitCallback, RowColumn primary) {
 
     if (updates.size() == 0) {
       // TODO do async
@@ -925,8 +792,8 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       stats.incrementEntriesSet(cols.size());
     }
 
-    Bytes primRow = null;
-    Column primCol = null;
+    Bytes primRow;
+    Column primCol;
 
     if (primary != null) {
       primRow = primary.getRow();
@@ -938,23 +805,9 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       primRow = notification.getRow();
       primCol = notification.getColumn();
     } else {
-
-      outer: for (Entry<Bytes, Map<Column, Bytes>> entry : updates.entrySet()) {
-        for (Entry<Column, Bytes> entry2 : entry.getValue().entrySet()) {
-          if (!isReadLock(entry2.getValue())) {
-            primRow = entry.getKey();
-            primCol = entry2.getKey();
-            break outer;
-          }
-        }
-      }
-
-      if (primRow == null) {
-        // there are only read locks, so nothing to write
-        deleteWeakRow();
-        commitCallback.committed();
-        return;
-      }
+      primRow = updates.keySet().iterator().next();
+      Map<Column, Bytes> colSet = updates.get(primRow);
+      primCol = colSet.keySet().iterator().next();
     }
 
     // get a primary column
@@ -971,6 +824,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
     // try to lock primary column
     final ConditionalMutation pcm =
         prewrite(cd.prow, cd.pcol, cd.pval, cd.prow, cd.pcol, isTriggerRow(cd.prow));
+
 
     ListenableFuture<Iterator<Result>> future = cd.acw.apply(Collections.singletonList(pcm));
     Futures.addCallback(future, new CommitCallback<Iterator<Result>>(cd) {
@@ -1017,8 +871,8 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
           break;
         case COMMITTED:
         default:
-          throw new IllegalStateException(
-              "unexpected tx state " + txInfo.status + " " + cd.prow + " " + cd.pcol);
+          throw new IllegalStateException("unexpected tx state " + txInfo.status + " " + cd.prow
+              + " " + cd.pcol);
 
       }
     }
@@ -1027,7 +881,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       cd.addPrimaryToRejected();
       getStats().setRejected(cd.getRejected());
       // TODO do async
-      checkForOrphanedLocks(cd);
+      readUnread(cd);
       if (checkForAckCollision(pcm)) {
         cd.commitObserver.alreadyAcknowledged();
       } else {
@@ -1047,8 +901,9 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
 
       for (Entry<Column, Bytes> colUpdates : rowUpdates.getValue().entrySet()) {
         if (cm == null) {
-          cm = prewrite(rowUpdates.getKey(), colUpdates.getKey(), colUpdates.getValue(), cd.prow,
-              cd.pcol, false);
+          cm =
+              prewrite(rowUpdates.getKey(), colUpdates.getKey(), colUpdates.getValue(), cd.prow,
+                  cd.pcol, false);
         } else {
           prewrite(cm, colUpdates.getKey(), colUpdates.getValue(), cd.prow, cd.pcol, false);
         }
@@ -1058,6 +913,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
     }
 
     cd.acceptedRows = new HashSet<>();
+
 
     ListenableFuture<Iterator<Result>> future = cd.bacw.apply(mutations);
     Futures.addCallback(future, new CommitCallback<Iterator<Result>>(cd) {
@@ -1085,7 +941,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       env.getSharedResources().getSyncCommitExecutor().execute(new SynchronousCommitTask(cd) {
         @Override
         protected void runCommitStep(CommitData cd) throws Exception {
-          checkForOrphanedLocks(cd);
+          readUnread(cd);
           rollbackOtherLocks(cd);
         }
       });
@@ -1102,6 +958,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
     }
   }
 
+
   private void rollbackOtherLocks(CommitData cd) throws Exception {
     // roll back locks
 
@@ -1112,14 +969,9 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
     ArrayList<Mutation> mutations = new ArrayList<>(cd.acceptedRows.size());
     for (Bytes row : cd.acceptedRows) {
       m = new Flutation(env, row);
-      for (Entry<Column, Bytes> entry : updates.get(row).entrySet()) {
-        if (isReadLock(entry.getValue())) {
-          m.put(entry.getKey(), ColumnConstants.RLOCK_PREFIX | ReadLockUtil.encodeTs(startTs, true),
-              DelReadLockValue.encodeRollback());
-        } else {
-          m.put(entry.getKey(), ColumnConstants.DEL_LOCK_PREFIX | startTs,
-              DelLockValue.encodeRollback(false, true));
-        }
+      for (Column col : updates.get(row).keySet()) {
+        m.put(col, ColumnConstants.DEL_LOCK_PREFIX | startTs,
+            DelLockValue.encodeRollback(false, true));
       }
       mutations.add(m);
     }
@@ -1152,6 +1004,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       }
     }, env.getSharedResources().getAsyncCommitExecutor());
   }
+
 
   private void beginSecondCommitPhase(CommitData cd, Stamp commitStamp) throws Exception {
     if (startTs < commitStamp.getGcTimestamp()) {
@@ -1213,6 +1066,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       }
     }
 
+
     ListenableFuture<Void> future =
         env.getSharedResources().getBatchWriter().writeMutationsAsyncFuture(mutations.values());
     Futures.addCallback(future, new CommitCallback<Void>(cd) {
@@ -1230,12 +1084,14 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
     boolean isTrigger = isTriggerRow(cd.prow) && cd.pcol.equals(notification.getColumn());
 
     Condition lockCheck =
-        new FluoCondition(env, cd.pcol).setIterators(iterConf).setValue(LockValue.encode(cd.prow,
-            cd.pcol, isWrite(cd.pval), isDelete(cd.pval), isTrigger, getTransactorID()));
+        new FluoCondition(env, cd.pcol).setIterators(iterConf).setValue(
+            LockValue.encode(cd.prow, cd.pcol, isWrite(cd.pval), isDelete(cd.pval), isTrigger,
+                getTransactorID()));
     final ConditionalMutation delLockMutation = new ConditionalFlutation(env, cd.prow, lockCheck);
 
     ColumnUtil.commitColumn(env, isTrigger, true, cd.pcol, isWrite(cd.pval), isDelete(cd.pval),
-        isReadLock(cd.pval), startTs, commitTs, observedColumns, delLockMutation);
+        startTs, commitTs, observedColumns, delLockMutation);
+
 
     ListenableFuture<Iterator<Result>> future =
         cd.acw.apply(Collections.singletonList(delLockMutation));
@@ -1268,8 +1124,8 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
             switch (txInfo.status) {
               case COMMITTED:
                 if (txInfo.commitTs != commitTs) {
-                  throw new IllegalStateException(
-                      cd.prow + " " + cd.pcol + " " + txInfo.commitTs + "!=" + commitTs);
+                  throw new IllegalStateException(cd.prow + " " + cd.pcol + " " + txInfo.commitTs
+                      + "!=" + commitTs);
                 }
                 ms = Status.ACCEPTED;
                 break;
@@ -1291,6 +1147,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
       postCommitPrimary(cd, commitTs, mutationStatus);
     }
   }
+
 
   private void postCommitPrimary(CommitData cd, long commitTs, Status mutationStatus)
       throws Exception {
@@ -1315,7 +1172,7 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
         ColumnUtil.commitColumn(env,
             isTriggerRow && colUpdates.getKey().equals(notification.getColumn()), false,
             colUpdates.getKey(), isWrite(colUpdates.getValue()), isDelete(colUpdates.getValue()),
-            isReadLock(colUpdates.getValue()), startTs, commitTs, observedColumns, m);
+            startTs, commitTs, observedColumns, m);
       }
 
       mutations.add(m);
@@ -1334,8 +1191,8 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
   }
 
   @VisibleForTesting
-  public boolean finishCommit(CommitData cd, Stamp commitStamp)
-      throws TableNotFoundException, MutationsRejectedException {
+  public boolean finishCommit(CommitData cd, Stamp commitStamp) throws TableNotFoundException,
+      MutationsRejectedException {
     deleteLocks(cd, commitStamp.getTxTimestamp());
     return true;
   }
@@ -1362,8 +1219,6 @@ public class TransactionImpl extends AbstractTransactionBase implements AsyncTra
   }
 
   public SnapshotScanner newSnapshotScanner(Span span, Collection<Column> columns) {
-    return new SnapshotScanner(env, new SnapshotScanner.Opts(span, columns, false), startTs, stats,
-        kve -> {
-        });
+    return new SnapshotScanner(env, new SnapshotScanner.Opts(span, columns), startTs, stats);
   }
 }
